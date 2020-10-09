@@ -1,6 +1,5 @@
 ﻿using Magicodes.ExporterAndImporter.Core;
 using Magicodes.ExporterAndImporter.Core.Extension;
-using Magicodes.ExporterAndImporter.Core.Filters;
 using Magicodes.ExporterAndImporter.Core.Models;
 using Magicodes.ExporterAndImporter.Csv.Utility;
 using System;
@@ -51,7 +50,7 @@ namespace Magicodes.ExporterAndImporter.Csv
         {
             var helper = new ExportHelper<T>();
             return Task.FromResult(helper.GetCsvExportAsByteArray(dataItems));
-            
+
         }
         /// <summary>
         /// 导出DataTable
@@ -64,6 +63,19 @@ namespace Magicodes.ExporterAndImporter.Csv
             var helper = new ExportHelper<T>();
             return Task.FromResult(helper.GetCsvExportAsByteArray<T>(dataItems));
         }
+
+        /// <summary>
+        ///     
+        /// </summary>
+        /// <param name="dataItems"></param>
+        /// <param name="type"></param>
+        /// <returns></returns>
+        /// <exception cref="NotImplementedException"></exception>
+        public Task<byte[]> ExportAsByteArray(DataTable dataItems, Type type)
+        {
+            throw new NotImplementedException();
+        }
+
         /// <summary>
         ///     导出Csv表头
         /// </summary>

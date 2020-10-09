@@ -11,15 +11,6 @@
 // 
 // ======================================================================
 
-using System;
-using System.Collections.Generic;
-using System.Drawing;
-using System.Drawing.Imaging;
-using System.IO;
-using System.Linq;
-using System.Linq.Dynamic.Core;
-using System.Reflection;
-using System.Threading.Tasks;
 using Magicodes.ExporterAndImporter.Core;
 using Magicodes.ExporterAndImporter.Core.Extension;
 using Magicodes.ExporterAndImporter.Core.Filters;
@@ -27,6 +18,16 @@ using Magicodes.ExporterAndImporter.Core.Models;
 using OfficeOpenXml;
 using OfficeOpenXml.Drawing;
 using OfficeOpenXml.Style;
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Linq.Dynamic.Core;
+using System.Reflection;
+using System.Threading.Tasks;
 
 namespace Magicodes.ExporterAndImporter.Excel.Utility
 {
@@ -46,6 +47,14 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         {
             FilePath = filePath;
             LabelingFilePath = labelingFilePath;
+        }
+
+        /// <summary>
+        /// </summary>
+        /// <param name="stream"></param>
+        public ImportHelper(Stream stream)
+        {
+            Stream = stream;
         }
 
         /// <summary>
@@ -69,7 +78,8 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                             HeaderRowIndex = importerAttribute.HeaderRowIndex,
                             MaxCount = importerAttribute.MaxCount,
                             ImportResultFilter = importerAttribute.ImportResultFilter,
-                            ImportHeaderFilter = importerAttribute.ImportHeaderFilter
+                            ImportHeaderFilter = importerAttribute.ImportHeaderFilter,
+                            IsDisableAllFilter = importerAttribute.IsDisableAllFilter
                         };
                     }
                     else
@@ -105,6 +115,16 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         protected List<ImporterHeaderInfo> ImporterHeaderInfos { get; set; }
 
         /// <summary>
+        ///     文件流
+        /// </summary>
+        protected Stream Stream { get; set; }
+
+        /// <summary>
+        ///     空行
+        /// </summary>
+        private List<int> EmptyRows { get; } = new List<int>();
+
+        /// <summary>
         /// </summary>
         public void Dispose()
         {
@@ -112,6 +132,7 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             FilePath = null;
             ImporterHeaderInfos = null;
             ImportResult = null;
+            Stream = null;
             GC.Collect();
         }
 
@@ -125,13 +146,24 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             ImportResult = new ImportResult<T>();
             try
             {
-                CheckImportFile(FilePath);
-                using (Stream stream = new FileStream(FilePath, FileMode.Open))
+                if (Stream == null)
                 {
-                    using (var excelPackage = new ExcelPackage(stream))
+                    CheckImportFile(FilePath);
+                    Stream = new FileStream(FilePath, FileMode.Open);
+                }
+                using (Stream)
+                {
+                    using (var excelPackage = new ExcelPackage(Stream))
                     {
                         #region 检查模板
+                        //获取导入实体列定义
+                        ParseHeader();
                         ParseTemplate(excelPackage);
+
+                        //Import results return header information
+                        //导入结果返回表头信息
+                        ImportResult.ImporterHeaderInfos = ImporterHeaderInfos;
+
                         if (ImportResult.HasError) return Task.FromResult(ImportResult);
                         #endregion
                         ParseData(excelPackage);
@@ -161,17 +193,14 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                         RepeatDataCheck();
                         #endregion
 
-                        //执行结果筛选器
-                        if (ExcelImporterSettings.ImportResultFilter != null)
-                        {
-                            var filter = (IImportResultFilter)ExcelImporterSettings.ImportResultFilter.Assembly.CreateInstance(ExcelImporterSettings.ImportResultFilter.FullName);
 
-                            if (filter == null)
-                            {
-                                throw new Exception("结果筛选器必须实现接口IImportResultFilter！");
-                            }
+                        #region 执行结果筛选器
+                        var filter = GetFilter<IImportResultFilter>(ExcelImporterSettings.ImportResultFilter);
+                        if (filter != null)
+                        {
                             ImportResult = filter.Filter(ImportResult);
                         }
+                        #endregion
                         //生成Excel错误标注
                         LabelingError(excelPackage);
                     }
@@ -181,8 +210,18 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             {
                 ImportResult.Exception = ex;
             }
-
             return Task.FromResult(ImportResult);
+        }
+
+        /// <summary>
+        /// 获取筛选器
+        /// </summary>
+        /// <typeparam name="TFilter"></typeparam>
+        /// <param name="filterType"></param>
+        /// <returns></returns>
+        private TFilter GetFilter<TFilter>(Type filterType = null) where TFilter : IFilter
+        {
+            return filterType.GetFilter<TFilter>(ExcelImporterSettings.IsDisableAllFilter);
         }
 
         /// <summary>
@@ -275,13 +314,40 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         /// <param name="excelPackage"></param>
         internal virtual void LabelingError(ExcelPackage excelPackage)
         {
+            //如果源路径为空则不允许生成标注文件
+            if (string.IsNullOrWhiteSpace(FilePath))
+            {
+                return;
+            }
+
             //是否标注错误
             if (ExcelImporterSettings.IsLabelingError && ImportResult.HasError)
             {
                 var worksheet = GetImportSheet(excelPackage);
+                //先移除原先的错误标注
+                if (worksheet.Comments != null && worksheet.Comments.Count > 0)
+                {
+                    int length = worksheet.Comments.Count;
+                    for (int i = 0; i < length; i++)
+                    {
+                        worksheet.Comments.RemoveAt(0);
+                    }
+                }
+
                 //TODO:标注模板错误
                 //标注数据错误
+                var excelRangeList = new List<ExcelRange>();
                 foreach (var item in ImportResult.RowErrors)
+                {
+                    excelRangeList.Add(worksheet.Cells[1, ImporterHeaderInfos.Count]);
+                    var gtRows = EmptyRows.Where(r => r > item.RowIndex);
+                    var ltRows = EmptyRows.Where(r => r < item.RowIndex);
+                    if (gtRows.Any() && ltRows.Any())
+                    {
+                        var rowIndex = gtRows.ToList().GetLargestContinuous();
+                        item.RowIndex += (rowIndex - item.RowIndex) + 1;
+                    }
+
                     foreach (var field in item.FieldErrors)
                     {
                         var col = ImporterHeaderInfos.First(p => p.Header.Name == field.Key);
@@ -299,7 +365,15 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                             cell.Comment.Author = col.Header.Author;
                         }
                     }
+                }
 
+                if (ExcelImporterSettings.IsOnlyErrorRows)
+                {
+                    excelPackage = new ExcelPackage();
+                    excelPackage.Workbook.Worksheets.Add("错误数据");
+                    worksheet.Cells[1, 1, 1, worksheet.Dimension.Columns].Copy(excelPackage.Workbook.Worksheets[0].Cells[1, 1, 1, worksheet.Dimension.Columns]);
+                    excelRangeList[0].Worksheet.Cells[2, 1, excelRangeList.Count + 1, worksheet.Dimension.Columns].Copy(excelPackage.Workbook.Worksheets[0].Cells[2, 1, 2, worksheet.Dimension.Columns]);
+                }
                 var ext = Path.GetExtension(FilePath);
                 var filePath = string.IsNullOrWhiteSpace(LabelingFilePath) ? FilePath.Replace(ext, "_" + ext) : LabelingFilePath;
                 excelPackage.SaveAs(new FileInfo(filePath));
@@ -323,19 +397,16 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             ParseHeader();
             ParseTemplate(excelPackage);
             //执行结果筛选器
-            if (ExcelImporterSettings.ImportResultFilter != null)
+            var filter = GetFilter<IImportResultFilter>(ExcelImporterSettings.ImportResultFilter);
+            if (filter != null)
             {
-                var filter = (IImportResultFilter)ExcelImporterSettings.ImportResultFilter.Assembly.CreateInstance(ExcelImporterSettings.ImportResultFilter.FullName);
-
-                if (filter == null)
-                {
-                    throw new Exception("结果筛选器必须实现接口IImportResultFilter！");
-                }
                 ImportResult = filter.Filter(ImportResult);
             }
+
             //if (ExcelImporterSettings.IsLabelingError && ImportResult.HasError)
             //业务错误必须标注
             var worksheet = GetImportSheet(excelPackage);
+
             //标注数据错误
             foreach (var item in bussinessErrorDataList)
             {
@@ -364,6 +435,62 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         }
 
         /// <summary>
+        /// 标注业务错误
+        /// </summary>
+        /// <param name="excelPackage"></param>
+        /// <param name="bussinessErrorDataList"></param>
+        /// <param name="fileByte">返回错误Excel流字节</param>
+        internal virtual void LabelingBussinessError(ExcelPackage excelPackage, List<DataRowErrorInfo> bussinessErrorDataList, out byte[] fileByte)
+        {
+            if (bussinessErrorDataList == null)
+            {
+                fileByte = null;
+                return;
+            }
+            this.ImportResult = new ImportResult<T>();
+            ParseHeader();
+            ParseTemplate(excelPackage);
+            //执行结果筛选器
+            var filter = GetFilter<IImportResultFilter>(ExcelImporterSettings.ImportResultFilter);
+            if (filter != null)
+            {
+                ImportResult = filter.Filter(ImportResult);
+            }
+
+            //if (ExcelImporterSettings.IsLabelingError && ImportResult.HasError)
+            //业务错误必须标注
+            var worksheet = GetImportSheet(excelPackage);
+
+            //标注数据错误
+            foreach (var item in bussinessErrorDataList)
+            {
+                item.RowIndex += ExcelImporterSettings.HeaderRowIndex;
+                foreach (var field in item.FieldErrors)
+                {
+                    var col = ImporterHeaderInfos.First(p => p.Header.Name == field.Key);
+                    var cell = worksheet.Cells[item.RowIndex, col.Header.ColumnIndex];
+                    cell.Style.Font.Color.SetColor(Color.Red);
+                    cell.Style.Font.Bold = true;
+                    if (cell.Comment == null)
+                    {
+                        cell.AddComment(string.Join(",", field.Value), col.Header.Author);
+                    }
+                    else
+                    {
+                        cell.Comment.Text = field.Value;
+
+                    }
+                }
+            }
+            using (var stream = new MemoryStream())
+            {
+                excelPackage.SaveAs(stream);
+                fileByte = stream.ToArray();
+            }
+            return;
+        }
+
+        /// <summary>
         ///     检查导入文件路劲
         /// </summary>
         /// <exception cref="ArgumentException">文件路径不能为空! - filePath</exception>
@@ -372,10 +499,10 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             if (string.IsNullOrWhiteSpace(filePath)) throw new ArgumentException("文件路径不能为空!", nameof(filePath));
 
             //TODO:在Docker容器中存在文件路径找不到问题，暂时先注释掉
-            //if (!File.Exists(filePath))
-            //{
-            //    throw new ImportException("导入文件不存在!");
-            //}
+            if (!File.Exists(filePath))
+            {
+                throw new FileNotFoundException("导入文件不存在!");
+            }
         }
 
         /// <summary>
@@ -385,8 +512,6 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         protected virtual void ParseTemplate(ExcelPackage excelPackage)
         {
             ImportResult.TemplateErrors = new List<TemplateErrorInfo>();
-            //获取导入实体列定义
-            ParseHeader();
             try
             {
                 //根据名称获取Sheet，如果不存在则取第一个
@@ -492,9 +617,11 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
 
                 if (string.IsNullOrWhiteSpace(importerHeaderAttribute.Name))
                     importerHeaderAttribute.Name = propertyInfo.GetDisplayName() ?? propertyInfo.Name;
-
+                var ignore = (propertyInfo.GetAttribute<IEIgnoreAttribute>(true) == null)
+                    ? importerHeaderAttribute.IsIgnore
+                    : propertyInfo.GetAttribute<IEIgnoreAttribute>(true).IsImportIgnore;
                 //忽略字段处理
-                if (importerHeaderAttribute.IsIgnore) continue;
+                if (ignore) continue;
 
                 var colHeader = new ImporterHeaderInfo
                 {
@@ -503,8 +630,33 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                     Header = importerHeaderAttribute,
                     ImportImageFieldAttribute = propertyInfo.GetAttribute<ImportImageFieldAttribute>(true)
                 };
-                ImporterHeaderInfos.Add(colHeader);
 
+                //设置ColumnIndex
+                if (colHeader.Header.ColumnIndex > 0)
+                {
+                    colHeader.Header.ColumnIndex = colHeader.Header.ColumnIndex;
+                }
+                else if (propertyInfo.GetAttribute<DisplayAttribute>(true) != null &&
+                         propertyInfo.GetAttribute<DisplayAttribute>(true).GetOrder() != null)
+                {
+                    colHeader.Header.ColumnIndex = propertyInfo.GetAttribute<DisplayAttribute>(true).Order;
+                }
+                //设置Description
+                if (colHeader.Header.Description.IsNullOrWhiteSpace())
+                {
+                    if (propertyInfo.GetAttribute<DescriptionAttribute>()?.Description != null)
+                    {
+                        colHeader.Header.Description = propertyInfo.GetAttribute<DescriptionAttribute>()?.Description;
+                    }
+                    else if (propertyInfo.GetAttribute<DisplayAttribute>()?.Description != null)
+                    {
+                        colHeader.Header.Description = propertyInfo.GetAttribute<DisplayAttribute>()?.Description;
+                    }
+                }
+
+                colHeader.Header.IsIgnore = ignore;
+
+                ImporterHeaderInfos.Add(colHeader);
                 #region 处理值映射
 
                 var mappings = propertyInfo.GetAttributes<ValueMappingAttribute>().ToList();
@@ -545,18 +697,13 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                 #endregion
             }
 
-            //列筛选器
-            if (ExcelImporterSettings.ImportHeaderFilter != null)
+            #region 执行列筛选器
+            var filter = GetFilter<IImportHeaderFilter>(ExcelImporterSettings.ImportHeaderFilter);
+            if (filter != null)
             {
-                var filter = (IImportHeaderFilter)ExcelImporterSettings.ImportHeaderFilter.Assembly.CreateInstance(ExcelImporterSettings.ImportHeaderFilter.FullName);
-
-                if (filter == null)
-                {
-                    throw new Exception("导入列筛选器必须实现接口IImportHeaderFilter！");
-                }
                 ImporterHeaderInfos = filter.Filter(ImporterHeaderInfos);
             }
-
+            #endregion
             return true;
         }
 
@@ -635,7 +782,21 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             return worksheet.Drawings[position] as ExcelPicture;
         }
 
-
+        /// <summary>
+        ///      获取图片
+        /// </summary>
+        /// <param name="worksheet"></param>
+        /// <param name="row"></param>
+        /// <param name="column"></param>
+        /// <returns></returns>
+        private ExcelPicture GetImage(ExcelWorksheet worksheet, int row, int column)
+        {
+            //var excelDrawings = worksheet.Drawings.Where(o => o.From.Row == row && o.From.Column ==
+            //    column);
+            var excelDrawings = worksheet.Drawings.FirstOrDefault(o => o.From.Row == row - 1 && o.From.Column ==
+                column - 1);
+            return excelDrawings as ExcelPicture;
+        }
 
         /// <summary>
         ///     解析数据
@@ -658,6 +819,7 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                 //跳过空行
                 if (worksheet.Cells[rowIndex, 1, rowIndex, worksheet.Dimension.End.Column].All(p => p.Text == string.Empty))
                 {
+                    EmptyRows.Add(rowIndex);
                     continue;
                 }
                 {
@@ -706,17 +868,43 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                             {
                                 if (col.ImportImageFieldAttribute != null)
                                 {
-                                    var position = imageBaseIndex == 0
-                                       ? rowIndex - 2 + (imageBaseIndex++ * worksheet.Dimension.End.Row)
-                                       : rowIndex - 3 + (imageBaseIndex++ * worksheet.Dimension.End.Row);
-                                    var excelPicture = GetImage(worksheet, position);
-                                    var path = Path.Combine(col.ImportImageFieldAttribute.ImageDirectory, Guid.NewGuid().ToString() + "." + excelPicture.ImageFormat.ToString());
+                                    //var position = 0;
+
+                                    //first   index    row  
+                                    // 4 ------ 7 ------ 3       3
+                                    // 3 ------ 5 ------ 2       2
+                                    // 2 ------ 3 ------ 1       0
+
+                                    //var row = ExcelImporterSettings.HeaderRowIndex > 1
+                                    //    ? ExcelImporterSettings.HeaderRowIndex + 1
+                                    //    : 2;
+
+                                    //var row1 = row + (ExcelImporterSettings.HeaderRowIndex);
+
+                                    //if (imageBaseIndex == 0)
+                                    //{
+                                    //    position = rowIndex -
+                                    //               row +
+                                    //               (imageBaseIndex++ * worksheet.Dimension.End.Row);
+                                    //}
+                                    //else
+                                    //{
+                                    //    position = rowIndex -
+                                    //               row1 +
+                                    //              imageBaseIndex++ * worksheet.Dimension.End.Row;
+                                    //}
+
+                                    //var excelPicture = GetImage(worksheet, position);
+
+                                    var excelPicture = GetImage(worksheet, cell.Start.Row, cell.Start.Column);
+
+                                    var path = Path.Combine(col.ImportImageFieldAttribute.ImageDirectory, Guid.NewGuid() + "." + excelPicture.ImageFormat);
                                     var value = string.Empty;
-                                    
+
                                     switch (col.ImportImageFieldAttribute.ImportImageTo)
                                     {
                                         case ImportImageTo.TempFolder:
-                                            value = Extension.Save(excelPicture.Image, path, excelPicture.ImageFormat);
+                                            value = Extension.Save(excelPicture?.Image, path, excelPicture.ImageFormat);
                                             break;
                                         case ImportImageTo.Base64:
                                             value = excelPicture.Image.ToBase64String(excelPicture.ImageFormat);
@@ -930,13 +1118,22 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                                     break;
                                 case "DateTime":
                                     {
-                                        if (!DateTime.TryParse(cell.Text, out var date))
+                                        if (cell.Value == null || cell.Text.IsNullOrWhiteSpace())
                                         {
-                                            AddRowDataError(rowIndex, col, $"值 {cell.Text} 无效，请填写正确的日期时间格式！");
+                                            AddRowDataError(rowIndex, col, $"值 {cell.Value} 无效，请填写正确的日期时间格式！");
+                                            break;
+                                        }
+                                        try
+                                        {
+                                            var date = cell.GetValue<DateTime>();
+                                            propertyInfo.SetValue(dataItem, date);
+                                        }
+                                        catch (Exception)
+                                        {
+                                            AddRowDataError(rowIndex, col, $"值 {cell.Value} 无效，请填写正确的日期时间格式！");
                                             break;
                                         }
 
-                                        propertyInfo.SetValue(dataItem, date);
                                     }
                                     break;
                                 case "DateTimeOffset":
@@ -1110,6 +1307,35 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             catch (Exception ex)
             {
                 msg = ex.Message;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 将存在的错误数据通过导入模板返回,并且标识业务错误原因
+        /// </summary>
+        /// <param name="stream">流</param>
+        /// <param name="bussinessErrorDataList">错误的业务数据</param>
+        /// <param name="fileByte">成功:错误错误文件流字节,失败 返回null</param>
+        /// <returns></returns>
+        public bool OutputBussinessErrorDataByte(Stream stream, List<DataRowErrorInfo> bussinessErrorDataList, out byte[] fileByte)
+        {
+            try
+            {
+                using (var memoryStream = new MemoryStream())
+                {
+                    stream.CopyTo(memoryStream);
+                    using (var excelPackage = new ExcelPackage(memoryStream))
+                    {
+                        //生成Excel错误标注
+                        LabelingBussinessError(excelPackage, bussinessErrorDataList, out fileByte);
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                fileByte = null;
                 return false;
             }
         }

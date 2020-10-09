@@ -1,23 +1,26 @@
 ﻿// ======================================================================
-// 
+//
 //           filename : PdfExporter.cs
 //           description :
-// 
+//
 //           created by 雪雁 at  2019-09-26 14:59
 //           文档官网：https://docs.xin-lai.com
 //           公众号教程：麦扣聊技术
 //           QQ群：85318032（编程交流）
 //           Blog：http://www.cnblogs.com/codelove/
-// 
+//
 // ======================================================================
 
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
+using System.Reflection;
 #if NET461
+
 using System.Drawing.Imaging;
 using TuesPechkin;
+
 #else
 using DinkToPdf;
 #endif
@@ -27,23 +30,42 @@ using Magicodes.ExporterAndImporter.Core.Extension;
 using Magicodes.ExporterAndImporter.Core.Models;
 using Magicodes.ExporterAndImporter.Html;
 using System.Text;
+using System.Runtime.InteropServices;
 
 namespace Magicodes.ExporterAndImporter.Pdf
 {
     /// <summary>
     ///     Pdf导出逻辑
     /// </summary>
-    public class PdfExporter : IExportListFileByTemplate, IExportFileByTemplate
+    public class PdfExporter : IPdfExporter
     {
-
 #if NET461
+
         private static readonly IConverter PdfConverter = new ThreadSafeConverter(new PdfToolset(
             new WinAnyCPUEmbeddedDeployment(
                 new TempFolderDeployment())));
+
 #else
         private static readonly SynchronizedConverter PdfConverter = new SynchronizedConverter(new PdfTools());
-        
+        public PdfExporter()
+        {
+            CustomAssemblyLoadContext context = new CustomAssemblyLoadContext();
+            // Check the platform and load the appropriate Library
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                var appPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+                var wkHtmlToPdfPath = Path.Combine(appPath, "runtimes", "linux-x64", "native", "wkhtmltox.so");
+                if (!File.Exists(wkHtmlToPdfPath))
+                {
+                    wkHtmlToPdfPath = Path.Combine(appPath, $"wkhtmltox.so");
+                }
+
+                context.LoadUnmanagedLibrary(wkHtmlToPdfPath);
+            }
+        }
+
 #endif
+
         /// <summary>
         ///     根据模板导出列表
         /// </summary>
@@ -99,12 +121,33 @@ namespace Magicodes.ExporterAndImporter.Pdf
             PdfExporterAttribute pdfExporterAttribute,
             string htmlString)
         {
+            var result = await ExportPdf(pdfExporterAttribute, htmlString);
+#if NETSTANDARD2_1
+            await File.WriteAllBytesAsync(fileName, result);
+#else
+            File.WriteAllBytes(fileName, result);
+#endif
+
+            var fileInfo = new ExportFileInfo(fileName, "application/pdf");
+            return await Task.FromResult(fileInfo);
+        }
+
+        /// <summary>
+        /// 导出到bytes
+        /// </summary>
+        /// <param name="pdfExporterAttribute"></param>
+        /// <param name="htmlString"></param>
+        /// <returns></returns>
+        private async Task<byte[]> ExportPdf(
+            PdfExporterAttribute pdfExporterAttribute,
+            string htmlString)
+        {
             var objSettings = new ObjectSettings
             {
 #if !NET461
-                        HtmlContent = htmlString,
-                        Encoding = Encoding.UTF8,
-                        PagesCount = pdfExporterAttribute.IsEnablePagesCount ? true : (bool?)null,
+                HtmlContent = htmlString,
+                Encoding = Encoding.UTF8,
+                PagesCount = pdfExporterAttribute.IsEnablePagesCount ? true : (bool?)null,
 #else
                 HtmlText = htmlString,
                 CountPages = pdfExporterAttribute.IsEnablePagesCount ? true : (bool?)null,
@@ -123,7 +166,7 @@ namespace Magicodes.ExporterAndImporter.Pdf
                 {
                     PaperSize = pdfExporterAttribute?.PaperKind,
                     Orientation = pdfExporterAttribute?.Orientation,
-                    
+
 #if !NET461
                     //Out = fileName,
                     ColorMode = ColorMode.Color,
@@ -138,16 +181,8 @@ namespace Magicodes.ExporterAndImporter.Pdf
                 }
             };
             var result = PdfConverter.Convert(htmlToPdfDocument);
-#if NETSTANDARD2_1
-            await File.WriteAllBytesAsync(fileName, result);
-#else
-            File.WriteAllBytes(fileName, result);
-#endif
-
-            var fileInfo = new ExportFileInfo(fileName, "application/pdf");
-            return await Task.FromResult(fileInfo);
+            return await Task.FromResult(result);
         }
-
 
         /// <summary>
         ///     获取全局导出定义
@@ -167,6 +202,96 @@ namespace Magicodes.ExporterAndImporter.Pdf
                 FontSize = export.FontSize,
                 HeaderFontSize = export.HeaderFontSize
             };
+        }
+        /// <summary>
+        ///		 获取全局导出定义
+        /// </summary>
+        /// <param name="type"></param>
+        /// <returns></returns>
+        private static PdfExporterAttribute GetExporterAttribute(Type type)
+        {
+            var exporterTableAttribute = type.GetAttribute<PdfExporterAttribute>(true);
+            if (exporterTableAttribute != null)
+                return exporterTableAttribute;
+
+            var export = type.GetAttribute<ExporterAttribute>(true) ?? new PdfExporterAttribute();
+            return new PdfExporterAttribute
+            {
+                FontSize = export.FontSize,
+                HeaderFontSize = export.HeaderFontSize
+            };
+        }
+        /// <summary>
+        /// 简单实现
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="data"></param>
+        /// <param name="template"></param>
+        /// <returns></returns>
+        public async Task<byte[]> ExportBytesByTemplate<T>(T data, string template) where T : class
+        {
+            var exporterAttribute = GetExporterAttribute<T>();
+            var exporter = new HtmlExporter();
+            var htmlString = await exporter.ExportByTemplate(data, template);
+            return await ExportPdf(exporterAttribute, htmlString);
+        }
+        /// <summary>
+        /// 简单实现
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="data"></param>
+        /// <param name="template"></param>
+        /// <returns></returns>
+        public async Task<byte[]> ExportListBytesByTemplate<T>(ICollection<T> data, string template) where T : class
+        {
+            var exporterAttribute = GetExporterAttribute<T>();
+            var exporter = new HtmlExporter();
+            var htmlString = await exporter.ExportListByTemplate(data, template);
+            return await ExportPdf(exporterAttribute, htmlString);
+        }
+        /// <summary>
+        ///		根据模板导出
+        /// </summary>
+        /// <param name="data"></param>
+        /// <param name="template"></param>
+        /// <param name="type"></param>
+        /// <returns></returns>
+        public async Task<byte[]> ExportBytesByTemplate(object data, string template, Type type)
+        {
+            var exporterAttribute = GetExporterAttribute(type);
+            var exporter = new HtmlExporter();
+            var htmlString = await exporter.ExportByTemplate(data, template, type);
+            return await ExportPdf(exporterAttribute, htmlString);
+        }
+
+        /// <summary>
+        /// 导出Pdf
+        /// </summary>
+        /// <param name="data"></param>
+        /// <param name="pdfExporterAttribute"></param>
+        /// <param name="template"></param>
+        /// <returns></returns>
+        public async Task<byte[]> ExportListBytesByTemplate<T>(ICollection<T> data, PdfExporterAttribute pdfExporterAttribute, string template) where T : class
+        {
+            var exporter = new HtmlExporter();
+            var htmlString = await exporter.ExportListByTemplate(data, template);
+            return await ExportPdf(pdfExporterAttribute, htmlString);
+        }
+
+        /// <summary>
+        /// 	导出Pdf
+        /// </summary>
+        /// <param name="data"></param>
+        /// <param name="pdfExporterAttribute"></param>
+        /// <param name="template"></param>
+        /// <typeparam name="T"></typeparam>
+        /// <returns></returns>
+        /// <exception cref="NotImplementedException"></exception>
+        public async Task<byte[]> ExportBytesByTemplate<T>(T data, PdfExporterAttribute pdfExporterAttribute, string template) where T : class
+        {
+            var exporter = new HtmlExporter();
+            var htmlString = await exporter.ExportByTemplate(data, template);
+            return await ExportPdf(pdfExporterAttribute, htmlString);
         }
     }
 }

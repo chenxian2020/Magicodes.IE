@@ -5,6 +5,7 @@ using OfficeOpenXml;
 using OfficeOpenXml.Table;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Data;
 using System.IO;
 using System.Linq;
@@ -13,9 +14,12 @@ using System.Threading.Tasks;
 using System.Linq.Dynamic.Core;
 using Magicodes.ExporterAndImporter.Core.Filters;
 using System.Drawing;
+using System.Dynamic;
 using OfficeOpenXml.Drawing;
 using OfficeOpenXml.Style;
 using System.Globalization;
+using System.Linq.Expressions;
+using System.Reflection;
 
 namespace Magicodes.ExporterAndImporter.Excel.Utility
 {
@@ -25,26 +29,43 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
     /// <typeparam name="T"></typeparam>
     public class ExportHelper<T> where T : class
     {
-        private ExporterAttribute _excelExporterAttribute;
+        private ExcelExporterAttribute _excelExporterAttribute;
         private ExcelWorksheet _excelWorksheet;
         private ExcelPackage _excelPackage;
         private List<ExporterHeaderInfo> _exporterHeaderList;
+        private Type _type;
+        private string _sheetName;
         /// <summary>
         /// 
         /// </summary>
-        public ExportHelper()
+        public ExportHelper(string sheetName = null)
         {
             if (typeof(DataTable).Equals(typeof(T)))
             {
                 IsDynamicDatableExport = true;
             }
+
+            if (typeof(ExpandoObject).Equals(typeof(T)))
+            {
+                IsExpandoObjectType = true;
+            }
+
+            _sheetName = sheetName;
         }
+        /// <summary>
+        /// </summary>
+        /// <param name="type"></param>
+        public ExportHelper(Type type)
+        {
+            this._type = type;
+        }
+
         /// <summary>
         /// 
         /// </summary>
         /// <param name="existExcelPackage"></param>
 
-        public ExportHelper(ExcelPackage existExcelPackage)
+        public ExportHelper(ExcelPackage existExcelPackage, string sheetName = null)
         {
             if (typeof(DataTable).Equals(typeof(T)))
             {
@@ -54,31 +75,55 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             {
                 this._excelPackage = existExcelPackage;
             }
+            _sheetName = sheetName;
         }
 
 
         /// <summary>
         ///     导出设置
         /// </summary>
-        public ExporterAttribute ExcelExporterSettings
+        public ExcelExporterAttribute ExcelExporterSettings
         {
             get
             {
                 if (_excelExporterAttribute == null)
                 {
-                    var type = typeof(T);
-                    if (typeof(DataTable).Equals(type))
+                    var type = _type ?? typeof(T);
+                    if (typeof(DataTable) == type)
                     {
-                        _excelExporterAttribute = new ExporterAttribute();
+                        _excelExporterAttribute = new ExcelExporterAttribute();
                     }
                     else
-                        _excelExporterAttribute = type.GetAttribute<ExporterAttribute>(true) ?? new ExporterAttribute();
+                        _excelExporterAttribute = type.GetAttribute<ExcelExporterAttribute>(true);
 
-                    //加载表头筛选器
-                    if (_excelExporterAttribute.ExporterHeaderFilter != null && typeof(IExporterHeaderFilter).IsAssignableFrom(_excelExporterAttribute.ExporterHeaderFilter))
+                    if (_excelExporterAttribute == null)
                     {
-                        ExporterHeaderFilter = (IExporterHeaderFilter)_excelExporterAttribute.ExporterHeaderFilter.Assembly.CreateInstance(_excelExporterAttribute.ExporterHeaderFilter.FullName, true, System.Reflection.BindingFlags.Default, null, _excelExporterAttribute.ExporterHeaderFilter.CreateType(), null, null);
+                        var exporterAttribute = type.GetAttribute<ExporterAttribute>(true);
+                        if (exporterAttribute != null)
+                        {
+                            _excelExporterAttribute = new ExcelExporterAttribute()
+                            {
+                                Author = exporterAttribute.Author,
+                                AutoFitAllColumn = exporterAttribute.AutoFitAllColumn,
+                                //ExcelOutputType = 
+                                AutoFitMaxRows = exporterAttribute.AutoFitMaxRows,
+                                ExporterHeaderFilter = exporterAttribute.ExporterHeaderFilter,
+                                FontSize = exporterAttribute.FontSize,
+                                HeaderFontSize = exporterAttribute.HeaderFontSize,
+                                MaxRowNumberOnASheet = exporterAttribute.MaxRowNumberOnASheet,
+                                Name = exporterAttribute.Name,
+                                TableStyle = exporterAttribute.TableStyle,
+                                AutoCenter = _excelExporterAttribute != null && _excelExporterAttribute.AutoCenter,
+                                IsDisableAllFilter = exporterAttribute.IsDisableAllFilter
+                            };
+                        }
+                        else
+                            _excelExporterAttribute = new ExcelExporterAttribute();
                     }
+
+                    #region 加载表头筛选器
+                    ExporterHeaderFilter = GetFilter<IExporterHeaderFilter>(_excelExporterAttribute.ExporterHeaderFilter);
+                    #endregion
                 }
                 return _excelExporterAttribute;
             }
@@ -94,7 +139,7 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             {
                 if (_excelWorksheet == null)
                 {
-                    AddExcelWorksheet();
+                    AddExcelWorksheet(_sheetName);
                 }
 
 
@@ -141,7 +186,7 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             get
             {
                 if (_exporterHeaderList == null) GetExporterHeaderInfoList();
-                if ((_exporterHeaderList == null || _exporterHeaderList.Count == 0) && !IsDynamicDatableExport) throw new Exception("请定义表头！");
+                if ((_exporterHeaderList == null || _exporterHeaderList.Count == 0) && !IsDynamicDatableExport && !IsExpandoObjectType) throw new Exception("请定义表头！");
                 return _exporterHeaderList;
             }
             set => _exporterHeaderList = value;
@@ -179,6 +224,11 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         protected bool IsDynamicDatableExport { get; set; }
 
         /// <summary>
+        /// 是否为ExpandoObject类型，调用LoadFromDictionaries以支持动态导出
+        /// </summary>
+        protected bool IsExpandoObjectType { get; set; }
+
+        /// <summary>
         /// 添加导出表头
         /// </summary>
         /// <param name="exporterHeaderInfos"></param>
@@ -191,7 +241,7 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         ///     获取头部定义
         /// </summary>
         /// <returns></returns>
-        protected virtual void GetExporterHeaderInfoList(DataTable dt = null)
+        protected virtual void GetExporterHeaderInfoList(DataTable dt = null, ICollection<T> dataItems = null)
         {
             _exporterHeaderList = new List<ExporterHeaderInfo>();
             if (dt != null)
@@ -209,14 +259,32 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                     AddExportHeaderInfo(item);
                 }
             }
+            else if (IsExpandoObjectType)
+            {
+                var items = dataItems as IEnumerable<IDictionary<string, object>>;
+                var keys = new List<string>(items.First().Keys);
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    var item = new ExporterHeaderInfo
+                    {
+                        Index = i + 1,
+                        PropertyName = keys[i],
+                        ExporterHeaderAttribute = new ExporterHeaderAttribute(keys[i]),
+                        CsTypeName = keys[i].GetType().GetCSharpTypeName(),
+                        DisplayName = keys[i]
+                    };
+                    AddExportHeaderInfo(item);
+                }
+            }
             else if (!IsDynamicDatableExport)
             {
-                var type = typeof(T);
+                var type = _type ?? typeof(T);
                 var objProperties = type.GetProperties();
-                if (objProperties == null || objProperties.Length == 0)
+                if (objProperties.Length == 0)
                     return;
                 for (var i = 0; i < objProperties.Length; i++)
                 {
+
                     var item = new ExporterHeaderInfo
                     {
                         Index = i + 1,
@@ -235,6 +303,40 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                                        item.ExporterHeaderAttribute.DisplayName.IsNullOrWhiteSpace()
                         ? item.PropertyName
                         : item.ExporterHeaderAttribute.DisplayName;
+                    //设置Format
+                    item.ExporterHeaderAttribute.Format = item.ExporterHeaderAttribute.Format.IsNullOrWhiteSpace()
+                        ? objProperties[i].GetDisplayFormat()
+                        : item.ExporterHeaderAttribute.Format;
+                    //设置Ignore
+                    item.ExporterHeaderAttribute.IsIgnore =
+                        (objProperties[i].GetAttribute<IEIgnoreAttribute>(true) == null) ?
+                        item.ExporterHeaderAttribute.IsIgnore : objProperties[i].GetAttribute<IEIgnoreAttribute>(true).IsExportIgnore;
+
+                    var mappings = objProperties[i].GetAttributes<ValueMappingAttribute>().ToList();
+                    foreach (var mappingAttribute in mappings.Where(mappingAttribute =>
+                        !item.MappingValues.ContainsKey(mappingAttribute.Value)))
+                        item.MappingValues.Add(mappingAttribute.Value, mappingAttribute.Text);
+
+                    //如果存在自定义映射，则不会生成默认映射
+                    if (!mappings.Any())
+                    {
+                        if (objProperties[i].PropertyType.IsEnum)
+                        {
+                            var propType = objProperties[i].PropertyType;
+                            var isNullable = propType.IsNullable();
+                            if (isNullable) propType = propType.GetNullableUnderlyingType();
+                            var values = propType.GetEnumTextAndValues();
+
+                            foreach (var value in values.Where(value => !item.MappingValues.ContainsKey(value.Key)))
+                                item.MappingValues.Add(value.Value, value.Key);
+
+                            if (isNullable)
+                                if (!item.MappingValues.ContainsKey(string.Empty))
+                                    item.MappingValues.Add(string.Empty, null);
+
+                        }
+                    }
+
                     AddExportHeaderInfo(item);
                 }
             }
@@ -269,13 +371,66 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         /// <returns>文件</returns>
         public virtual ExcelPackage Export(ICollection<T> dataItems)
         {
-            AddDataItems(dataItems);
+            if (!IsExpandoObjectType)
+            {
+                var list = ParseData(dataItems);
+                AddDataItems(list);
+            }
+            else
+            {
+                AddDataItems(dataItems);
+            }
+            // 为了传入dataItems，在这里提前调用一下
+            if (_exporterHeaderList == null) GetExporterHeaderInfoList(null, dataItems);
             //仅当存在图片表头才渲染图片
             if (ExporterHeaderList.Any(p => p.ExportImageFieldAttribute != null))
             {
                 AddPictures(dataItems.Count);
             }
+
+            DisableAutoFitWhenDataRowsIsLarge(dataItems.Count);
             return AddHeaderAndStyles();
+        }
+
+        /// <summary>
+        ///     复制Sheet
+        /// </summary>
+        /// <param name="currentws"></param>
+        /// <param name="tempws"></param>
+        public void CopySheet(int currentws, int tempws)
+        {
+            var tempWorksheet = _excelPackage.Workbook.Worksheets[tempws];
+            var ws = _excelPackage.Workbook.Worksheets[currentws];
+
+            tempWorksheet.Cells[1, 1, tempWorksheet.Dimension.Rows, tempWorksheet.Dimension.Columns]
+                .Copy(ws.Cells[1, ws.Dimension.End.Column + 2,
+                    tempWorksheet.Dimension.Rows, ws.Dimension.End.Column + tempWorksheet.Dimension.End.Column]);
+
+            _excelPackage.Workbook.Worksheets.Delete(tempWorksheet);
+        }
+
+        /// <summary>
+        ///     复制Rows
+        /// </summary>
+        /// <param name="currentws"></param>
+        /// <param name="tempws"></param>
+        /// <param name="isAppendHeaders"></param>
+        public void CopyRows(int currentws, int tempws, bool isAppendHeaders)
+        {
+            var tempWorksheet = _excelPackage.Workbook.Worksheets[tempws];
+            var ws = _excelPackage.Workbook.Worksheets[currentws];
+
+            int beginRows = 2;
+            if (isAppendHeaders)
+            {
+                beginRows = 1;
+            }
+
+            tempWorksheet.Cells[beginRows, 1, tempWorksheet.Dimension.Rows, tempWorksheet.Dimension.Columns]
+                .Copy(ws.Cells[ws.Dimension.Rows + 2, 1,
+                    tempWorksheet.Dimension.Rows + ws.Dimension.Rows, tempWorksheet.Dimension.End.Column]);
+
+            _excelPackage.Workbook.Worksheets.Delete(tempWorksheet);
         }
 
 
@@ -317,7 +472,27 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             AddDataItems(dataItems);
             //TODO:动态导出暂不考虑支持图片导出，后续可以考虑通过约定实现
             //AddPictures(dataItems.Rows.Count);
+
+            DisableAutoFitWhenDataRowsIsLarge(dataItems.Rows.Count);
             return AddHeaderAndStyles();
+        }
+
+        /// <summary>
+        /// 在数据达到设置值时禁用自适应列
+        /// </summary>
+        /// <param name="count"></param>
+        private void DisableAutoFitWhenDataRowsIsLarge(int count)
+        {
+            //如果已经设置了AutoFitMaxRows并且当前数据超过此设置，则关闭自适应列的配置
+            if (ExcelExporterSettings.AutoFitMaxRows != 0 && count > ExcelExporterSettings.AutoFitMaxRows)
+            {
+                ExcelExporterSettings.AutoFitAllColumn = false;
+                foreach (var item in ExporterHeaderList)
+                {
+                    if (item.ExporterHeaderAttribute != null)
+                        item.ExporterHeaderAttribute.IsAutoFit = false;
+                }
+            }
         }
 
         /// <summary>
@@ -346,7 +521,7 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         /// </summary>
         /// <param name="dataItems"></param>
         /// <param name="excelRange"></param>
-        protected void AddDataItems(ICollection<T> dataItems, ExcelRangeBase excelRange = null)
+        protected void AddDataItems(dynamic dataItems, ExcelRangeBase excelRange = null)
         {
             if (excelRange == null)
                 excelRange = CurrentExcelWorksheet.Cells["A1"];
@@ -354,12 +529,86 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             if (dataItems == null || dataItems.Count == 0)
                 return;
 
-            var tbStyle = TableStyles.Medium10;
-            if (!ExcelExporterSettings.TableStyle.IsNullOrWhiteSpace())
-                tbStyle = (TableStyles)Enum.Parse(typeof(TableStyles), ExcelExporterSettings.TableStyle);
+            if (ExcelExporterSettings.ExcelOutputType == ExcelOutputTypes.DataTable)
+            {
+                var tbStyle = TableStyles.Medium10;
+                if (!ExcelExporterSettings.TableStyle.IsNullOrWhiteSpace())
+                    tbStyle = (TableStyles)Enum.Parse(typeof(TableStyles), ExcelExporterSettings.TableStyle);
+                var er = excelRange.LoadFromDictionaries(dataItems, true, TableStyles.None);
+                CurrentExcelTable = CurrentExcelWorksheet.Tables.GetFromRange(er);
+            }
+            else
+            {
+                if (IsExpandoObjectType)
+                    excelRange.LoadFromDictionaries(dataItems, true, TableStyles.None);
+                else
+                    excelRange.LoadFromDictionaries(dataItems, true, TableStyles.None);
+            }
+        }
 
-            var er = excelRange.LoadFromCollection(dataItems, true, tbStyle);
-            CurrentExcelTable = CurrentExcelWorksheet.Tables.GetFromRange(er);
+        /// <summary>
+        ///     数据解析
+        /// </summary>
+        /// <param name="dataItems"></param>
+        protected virtual List<ExpandoObject> ParseData(ICollection<T> dataItems)
+        {
+            var type = typeof(T);
+            var properties = type.GetProperties();
+            List<ExpandoObject> list = new List<ExpandoObject>();
+            foreach (var dataItem in dataItems)
+            {
+                dynamic obj = new ExpandoObject();
+                foreach (var propertyInfo in properties)
+                {
+                    if (propertyInfo.PropertyType.IsEnum)
+                    {
+                        var col = ExporterHeaderList.First(a => a.PropertyName == propertyInfo.Name);
+                        var value = type.GetProperty(propertyInfo.Name)?.GetValue(dataItem)?.ToString();
+
+                        if (col.MappingValues.Count > 0 && col.MappingValues.ContainsKey(value ?? string.Empty))
+                        {
+                            var mapValue = col.MappingValues.FirstOrDefault(f => f.Key == value);
+                            ((IDictionary<string, object>)obj)[propertyInfo.Name] = mapValue.Value;
+                        }
+                    }
+                    else if (propertyInfo.PropertyType.GetCSharpTypeName() == "Boolean")
+                    {
+                        var col = ExporterHeaderList.First(a => a.PropertyName == propertyInfo.Name);
+                        var value = Convert.ToBoolean(type.GetProperty(propertyInfo.Name)?.GetValue(dataItem));
+
+                        if (col.MappingValues.Count > 0 && col.MappingValues.ContainsKey(value))
+                        {
+                            var mapValue = col.MappingValues.FirstOrDefault(f => f.Key == value);
+                            ((IDictionary<string, object>)obj)[propertyInfo.Name] = mapValue.Value;
+                        }
+                        else
+                        {
+                            ((IDictionary<string, object>)obj)[propertyInfo.Name] = value;
+                        }
+                    }
+                    else if (propertyInfo.PropertyType.GetCSharpTypeName() == "Nullable<Boolean>")
+                    {
+                        var col = ExporterHeaderList.First(a => a.PropertyName == propertyInfo.Name);
+                        var value = Convert.ToBoolean(type.GetProperty(propertyInfo.Name)?.GetValue(dataItem));
+
+                        if (col.MappingValues.Count > 0 && col.MappingValues.ContainsKey(value))
+                        {
+                            var mapValue = col.MappingValues.FirstOrDefault(f => f.Key == value);
+                            ((IDictionary<string, object>)obj)[propertyInfo.Name] = mapValue.Value;
+                        }
+                        else
+                        {
+                            ((IDictionary<string, object>)obj)[propertyInfo.Name] = value;
+                        }
+                    }
+                    else
+                    {
+                        ((IDictionary<string, object>)obj)[propertyInfo.Name] = type.GetProperty(propertyInfo.Name)?.GetValue(dataItem)?.ToString();
+                    }
+                }
+                list.Add(obj);
+            }
+            return list;
         }
 
         /// <summary>
@@ -367,13 +616,18 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         /// </summary>
         protected void AddPictures(int rowCount)
         {
-            for (var i = 0; i < ExporterHeaderList.Count; i++)
+            int ignoreCount = 0;
+            for (var colIndex = 0; colIndex < ExporterHeaderList.Count; colIndex++)
             {
-                if (ExporterHeaderList[i].ExportImageFieldAttribute != null)
+                if (ExporterHeaderList[colIndex].ExporterHeaderAttribute.IsIgnore)
                 {
-                    for (var j = 1; j <= rowCount; j++)
+                    ignoreCount++;
+                }
+                if (ExporterHeaderList[colIndex].ExportImageFieldAttribute != null)
+                {
+                    for (var rowIndex = 1; rowIndex <= rowCount; rowIndex++)
                     {
-                        var cell = CurrentExcelWorksheet.Cells[j + 1, i + 1];
+                        var cell = CurrentExcelWorksheet.Cells[rowIndex + 1, colIndex + 1];
                         var url = cell.Text;
                         if (File.Exists(url) || url.StartsWith("http", StringComparison.OrdinalIgnoreCase))
                         {
@@ -383,25 +637,26 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                                 var bitmap = Extension.GetBitmapByUrl(url);
                                 if (bitmap == null)
                                 {
-                                    cell.Value = ExporterHeaderList[i].ExportImageFieldAttribute.Alt;
+                                    cell.Value = ExporterHeaderList[colIndex].ExportImageFieldAttribute.Alt;
                                 }
                                 else
                                 {
                                     var pic = CurrentExcelWorksheet.Drawings.AddPicture(Guid.NewGuid().ToString(), bitmap);
-                                    pic.SetPosition(j, ExporterHeaderList[i].ExportImageFieldAttribute.Height / 5, i - 1, 0);
-                                    CurrentExcelWorksheet.Row(j + 1).Height = ExporterHeaderList[i].ExportImageFieldAttribute.Height;
-                                    pic.SetSize(ExporterHeaderList[i].ExportImageFieldAttribute.Width * 7, ExporterHeaderList[i].ExportImageFieldAttribute.Height);
+                                    pic.SetPosition(rowIndex, ExporterHeaderList[colIndex].ExportImageFieldAttribute.Height / 5, colIndex - ignoreCount, 0);
+                                    CurrentExcelWorksheet.Row(rowIndex + 1).Height = ExporterHeaderList[colIndex].ExportImageFieldAttribute.Height;
+                                    //pic.SetSize(ExporterHeaderList[colIndex].ExportImageFieldAttribute.Width * 7, ExporterHeaderList[colIndex].ExportImageFieldAttribute.Height);
+                                    pic.SetSize(ExporterHeaderList[colIndex].ExportImageFieldAttribute.Width * 7, ExporterHeaderList[colIndex].ExportImageFieldAttribute.Height);
                                 }
-                               
+
                             }
                             catch (Exception)
                             {
-                                cell.Value = ExporterHeaderList[i].ExportImageFieldAttribute.Alt;
+                                cell.Value = ExporterHeaderList[colIndex].ExportImageFieldAttribute.Alt;
                             }
                         }
                         else
                         {
-                            cell.Value = ExporterHeaderList[i].ExportImageFieldAttribute.Alt;
+                            cell.Value = ExporterHeaderList[colIndex].ExportImageFieldAttribute.Alt;
                         }
                     }
                 }
@@ -444,7 +699,7 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         protected void DeleteIgnoreColumns()
         {
             var deletedCount = 0;
-            foreach (var exporterHeaderDto in ExporterHeaderList.Where(p => p.ExporterHeaderAttribute.IsIgnore))
+            foreach (var exporterHeaderDto in ExporterHeaderList.Where(p => p.ExporterHeaderAttribute != null && p.ExporterHeaderAttribute.IsIgnore))
             {
                 //TODO:后续重写底层逻辑，直接从数据层面拦截
                 CurrentExcelWorksheet.DeleteColumn(exporterHeaderDto.Index - deletedCount);
@@ -457,23 +712,44 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
         /// </summary>
         protected void AddHeader()
         {
-            if (CurrentExcelTable == null)
+            //NoneStyle的时候没创建Table
+            //https://github.com/JanKallman/EPPlus/blob/4dacf27661b24d92e8ba3d03d51dd5468845e6c1/EPPlus/ExcelRangeBase.cs#L2013
+            var isNoneStyle = ExcelExporterSettings.TableStyle == TableStyles.None.ToString();
+
+            if (CurrentExcelTable == null && ExcelExporterSettings.ExcelOutputType == ExcelOutputTypes.DataTable && !isNoneStyle)
             {
                 var cols = ExporterHeaderList.Count;
-                var range = CurrentExcelWorksheet.Cells[1, 1, 10, cols];
-                CurrentExcelTable = CurrentExcelWorksheet.Tables.Add(range, "Table");
+                var range = CurrentExcelWorksheet.Cells[1, 1, CurrentExcelWorksheet.Dimension?.End.Row ?? 10, cols];
+                //https://github.com/dotnetcore/Magicodes.IE/issues/66
+                CurrentExcelTable = CurrentExcelWorksheet.Tables.Add(range, $"Table{CurrentExcelWorksheet.Index}");
+                CurrentExcelTable.ShowHeader = true;
+                Enum.TryParse(ExcelExporterSettings.TableStyle, out TableStyles outStyle);
+                CurrentExcelTable.TableStyle = outStyle;
             }
-            CurrentExcelTable.ShowHeader = true;
+
+            if (ExcelExporterSettings.AutoCenter)
+            {
+                CurrentExcelWorksheet.Cells[1, 1, CurrentExcelWorksheet.Dimension?.End.Row ?? 10, ExporterHeaderList.Count].Style.HorizontalAlignment = ExcelHorizontalAlignment.Center;
+            }
+
             foreach (var exporterHeaderDto in ExporterHeaderList)
             {
                 var exporterHeaderAttribute = exporterHeaderDto.ExporterHeaderAttribute;
                 if (exporterHeaderAttribute != null && !exporterHeaderAttribute.IsIgnore)
                 {
-                    var col = CurrentExcelTable.Columns[exporterHeaderDto.Index - 1];
-                    col.Name = exporterHeaderDto.DisplayName;
-
                     var colCell = CurrentExcelWorksheet.Cells[1, exporterHeaderDto.Index];
                     colCell.Style.Font.Bold = exporterHeaderAttribute.IsBold;
+
+                    if (CurrentExcelTable != null)
+                    {
+                        var col = CurrentExcelTable.Columns[exporterHeaderDto.Index - 1];
+                        col.Name = exporterHeaderDto.DisplayName;
+                    }
+                    else
+                    {
+                        colCell.Value = exporterHeaderDto.DisplayName;
+                    }
+
 
                     var size = ExcelExporterSettings?.HeaderFontSize ?? exporterHeaderAttribute.FontSize;
                     if (size.HasValue)
@@ -490,8 +766,8 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
             foreach (var exporterHeader in ExporterHeaderList)
             {
                 var col = CurrentExcelWorksheet.Column(exporterHeader.Index);
-                if (!string.IsNullOrWhiteSpace(exporterHeader.ExporterHeaderAttribute.Format))
-                { 
+                if (exporterHeader.ExporterHeaderAttribute != null && !string.IsNullOrWhiteSpace(exporterHeader.ExporterHeaderAttribute.Format))
+                {
                     col.Style.Numberformat.Format = exporterHeader.ExporterHeaderAttribute.Format;
 
                 }
@@ -512,14 +788,41 @@ namespace Magicodes.ExporterAndImporter.Excel.Utility
                             break;
                     }
                 }
-                if (!ExcelExporterSettings.AutoFitAllColumn && exporterHeader.ExporterHeaderAttribute.IsAutoFit)
+
+                if (!ExcelExporterSettings.AutoFitAllColumn && exporterHeader.ExporterHeaderAttribute != null && exporterHeader.ExporterHeaderAttribute.IsAutoFit)
                     col.AutoFit();
+
                 if (exporterHeader.ExportImageFieldAttribute != null)
                 {
                     col.Width = exporterHeader.ExportImageFieldAttribute.Width;
                 }
-                
+
+                if (exporterHeader.ExporterHeaderAttribute != null)
+                {
+                    //设置单元格宽度
+                    var width = exporterHeader.ExporterHeaderAttribute.Width;
+                    if (width > 0)
+                    {
+                        col.Width = width;
+                    }
+
+                    if (exporterHeader.ExporterHeaderAttribute.AutoCenterColumn)
+                    {
+                        col.Style.HorizontalAlignment = ExcelHorizontalAlignment.Center;
+                    }
+                }
             }
+        }
+
+        /// <summary>
+        /// 获取筛选器
+        /// </summary>
+        /// <typeparam name="TFilter"></typeparam>
+        /// <param name="filterType"></param>
+        /// <returns></returns>
+        private TFilter GetFilter<TFilter>(Type filterType = null) where TFilter : IFilter
+        {
+            return filterType.GetFilter<TFilter>(ExcelExporterSettings.IsDisableAllFilter);
         }
     }
 }
